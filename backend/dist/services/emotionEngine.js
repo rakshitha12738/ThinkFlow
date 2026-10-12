@@ -34,7 +34,7 @@ export function fuseMoodSignals(params) {
             confidence: clamp(0.55 + latestVibeScore / 250, 0.5, 0.92),
         };
     }
-    const blendedConfidence = manualMood === aiMood
+    const blendedConfidence = manualMood === aiMood || (manualMood === "confident" && aiMood === "energetic")
         ? 0.93
         : clamp(safeAvg([
             manualEnergy ? manualEnergy / 10 : 0.5,

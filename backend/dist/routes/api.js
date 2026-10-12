@@ -1,11 +1,14 @@
 import { Router } from "express";
+import crypto from "node:crypto";
 import { nanoid } from "nanoid";
 import { z } from "zod";
 import { db } from "../storage/db.js";
 import { rollingRange, toIsoDate } from "../utils.js";
 import { buildBreakRecommendation, determineAdaptiveMode, evaluateFatigueRisk, nextNudgeTime, styleCompanionMessage, } from "../services/adaptiveCompanion.js";
 import { buildCircadianDashboard, buildManualCircadianGraph, filterIsoWindow, inferHabitLogFromSnapshots, } from "../services/circadianInsights.js";
-import { computeSessionVibeAverage, fuseMoodSignals, inferEmotionFromTyping, } from "../services/emotionEngine.js";
+import { computeSessionVibeAverage, fuseMoodSignals, } from "../services/emotionEngine.js";
+import { inferEmotion } from "../services/xgbEmotionClassifier.js";
+import { deleteUserResearchData, getResearchDatasetStats, recordResearchSample, updateUserResearchConsent, } from "../services/researchDataService.js";
 export const apiRouter = Router();
 const createUserSchema = z.object({
     displayName: z.string().min(2),
@@ -14,6 +17,9 @@ const createUserSchema = z.object({
 });
 const updatePersonalitySchema = z.object({
     personalityMode: z.enum(["strict-mentor", "friendly-buddy", "interviewer"]),
+});
+const updateConsentSchema = z.object({
+    optedIn: z.boolean(),
 });
 const sleepSchema = z.object({
     userId: z.string().min(1),
@@ -25,7 +31,7 @@ const sleepSchema = z.object({
 const manualMoodSchema = z.object({
     userId: z.string().min(1),
     timestamp: z.string().datetime().optional(),
-    mood: z.enum(["calm", "frustrated", "energetic", "fatigued", "neutral"]),
+    mood: z.enum(["calm", "frustrated", "energetic", "fatigued", "neutral", "confident"]),
     energy: z.number().min(1).max(10),
     notes: z.string().max(600).optional(),
 });
@@ -59,13 +65,44 @@ const quizSchema = z.object({
 const manualCircadianLogSchema = z.object({
     userId: z.string().min(1).optional(),
     timestamp: z.string().datetime().optional(),
-    mood: z.enum(["calm", "frustrated", "energetic", "fatigued", "neutral"]),
+    mood: z.enum(["calm", "frustrated", "energetic", "fatigued", "neutral", "confident"]),
     energy: z.number().min(1).max(10),
     sleepHours: z.number().min(0).max(14),
     sleepScore: z.number().min(0).max(100),
     focusScore: z.number().min(0).max(10),
     stressScore: z.number().min(0).max(10),
     notes: z.string().max(800).optional(),
+});
+const submitResearchSampleSchema = z
+    .object({
+    userId: z.string().min(1),
+    sessionId: z.string().min(1),
+    window: z.object({
+        charsTyped: z.number().int().min(0),
+        wordsTyped: z.number().int().min(0),
+        backspaces: z.number().int().min(0),
+        errorCount: z.number().int().min(0),
+        pauseMs: z.number().int().min(0),
+        durationMs: z.number().int().min(1000),
+        timestamp: z.string().datetime(), // Window end timestamp
+    }),
+    selfReport: z.object({
+        emotion: z.enum(["calm", "frustrated", "energetic", "fatigued", "neutral", "confident"]),
+        energy: z.number().int().min(1).max(10).optional(),
+        reportTimestamp: z.string().datetime(), // Self-report timestamp
+    }),
+})
+    .refine((data) => data.window.wordsTyped <= data.window.charsTyped, {
+    message: "Inconsistent metrics: wordsTyped cannot exceed charsTyped",
+    path: ["window", "wordsTyped"],
+})
+    .refine((data) => data.window.pauseMs <= data.window.durationMs, {
+    message: "Inconsistent metrics: pauseMs cannot exceed durationMs",
+    path: ["window", "pauseMs"],
+})
+    .refine((data) => data.window.errorCount <= data.window.charsTyped + data.window.backspaces, {
+    message: "Inconsistent metrics: errorCount cannot exceed total keystrokes (charsTyped + backspaces)",
+    path: ["window", "errorCount"],
 });
 const typingBridgeSchema = z.object({
     mood: z.string().min(1).default("Neutral"),
@@ -207,7 +244,7 @@ apiRouter.post("/telemetry/typing", async (req, res) => {
     if (!parsed.success) {
         return res.status(400).json({ error: parsed.error.flatten() });
     }
-    const analysis = inferEmotionFromTyping(parsed.data);
+    const analysis = inferEmotion(parsed.data);
     const snapshot = {
         id: nanoid(),
         ...parsed.data,
@@ -432,6 +469,19 @@ apiRouter.post("/extension/link", async (req, res) => {
     if (!parsed.success) {
         return res.status(400).json({ error: parsed.error.flatten() });
     }
+    // Revoke any previous active links for this user and installId
+    if (db.data.extensionLinks) {
+        for (const existing of db.data.extensionLinks) {
+            if (existing.userId === parsed.data.userId &&
+                existing.installId === parsed.data.installId &&
+                !existing.revokedAt) {
+                existing.revokedAt = new Date().toISOString();
+            }
+        }
+    }
+    // Generate a cryptographically secure 256-bit token
+    const rawToken = `tf_sec_${crypto.randomBytes(32).toString("hex")}`;
+    const tokenHash = crypto.createHash("sha256").update(rawToken).digest("hex");
     const link = {
         id: nanoid(),
         userId: parsed.data.userId,
@@ -439,17 +489,30 @@ apiRouter.post("/extension/link", async (req, res) => {
         installId: parsed.data.installId,
         linkedAt: new Date().toISOString(),
         linkCode: `TF-${nanoid(8).toUpperCase()}`,
+        tokenHash,
     };
     db.data.extensionLinks.push(link);
     await db.write();
-    res.status(201).json(link);
+    res.status(201).json({ ...link, token: rawToken });
+});
+apiRouter.post("/extension/revoke", async (req, res) => {
+    const auth = extractAndVerifyBearerToken(req);
+    if (!auth.authenticated) {
+        return res.status(auth.status).json({ error: auth.error });
+    }
+    const link = db.data.extensionLinks?.find((l) => l.id === auth.linkId);
+    if (link) {
+        link.revokedAt = new Date().toISOString();
+        await db.write();
+    }
+    res.json({ ok: true, revoked: true });
 });
 apiRouter.post("/extension/events/typing", async (req, res) => {
     const parsed = typingSnapshotSchema.safeParse(req.body);
     if (!parsed.success) {
         return res.status(400).json({ error: parsed.error.flatten() });
     }
-    const analysis = inferEmotionFromTyping(parsed.data);
+    const analysis = inferEmotion(parsed.data);
     const snapshot = {
         id: nanoid(),
         ...parsed.data,
@@ -459,6 +522,26 @@ apiRouter.post("/extension/events/typing", async (req, res) => {
         vibeScore: analysis.vibeScore,
     };
     db.data.typingSnapshots.push(snapshot);
+    const aiMood = {
+        frustration: "frustrated",
+        confidence: "energetic",
+        neutral: "neutral",
+    };
+    db.data.moodEntries.push({
+        id: nanoid(),
+        userId: parsed.data.userId,
+        timestamp: snapshot.timestamp,
+        mood: aiMood[analysis.emotionSignal],
+        energy: Math.max(1, Math.round(snapshot.vibeScore / 10)),
+        source: "ai",
+        confidence: Number((0.6 + snapshot.vibeScore / 250).toFixed(2)),
+    });
+    const today = toIsoDate(new Date(snapshot.timestamp));
+    const existingHabit = db.data.habitLogs.find((entry) => entry.userId === parsed.data.userId && entry.date === today);
+    if (!existingHabit) {
+        const inferred = inferHabitLogFromSnapshots(parsed.data.userId, db.data.typingSnapshots.filter((entry) => entry.userId === parsed.data.userId), today);
+        db.data.habitLogs.push(inferred);
+    }
     await db.write();
     const recentSnapshots = db.data.typingSnapshots.filter((s) => s.userId === parsed.data.userId).slice(-6);
     const recentMoods = db.data.moodEntries.filter((m) => m.userId === parsed.data.userId).slice(-6);
@@ -468,6 +551,8 @@ apiRouter.post("/extension/events/typing", async (req, res) => {
         adaptiveMode: adaptive.mode,
         reason: adaptive.reason,
         vibeScore: snapshot.vibeScore,
+        source: analysis.source,
+        modelVersion: analysis.modelVersion,
     });
 });
 apiRouter.post("/gamification/quiz-attempt", async (req, res) => {
@@ -511,4 +596,129 @@ apiRouter.get("/gamification/:userId/score", (req, res) => {
                     ? "Focused Explorer"
                     : "Starter",
     });
+});
+/**
+ * Cryptographically verifies caller identity on sensitive endpoints using bearer token authentication.
+ * Looks up the SHA-256 hash of the bearer token against active extension links in the database.
+ */
+export function extractAndVerifyBearerToken(req) {
+    const authHeader = req.headers["authorization"];
+    if (!authHeader || typeof authHeader !== "string") {
+        return {
+            authenticated: false,
+            status: 401,
+            error: "Unauthorized: Missing Authorization bearer token header",
+        };
+    }
+    const parts = authHeader.trim().split(/\s+/);
+    if (parts.length !== 2 || parts[0].toLowerCase() !== "bearer") {
+        return {
+            authenticated: false,
+            status: 401,
+            error: "Unauthorized: Invalid Authorization header format. Expected 'Bearer <token>'",
+        };
+    }
+    const token = parts[1].trim();
+    if (!token) {
+        return {
+            authenticated: false,
+            status: 401,
+            error: "Unauthorized: Empty bearer token",
+        };
+    }
+    const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+    const link = db.data.extensionLinks?.find((l) => l.tokenHash === tokenHash && !l.revokedAt);
+    if (!link) {
+        return {
+            authenticated: false,
+            status: 401,
+            error: "Unauthorized: Invalid or revoked bearer token",
+        };
+    }
+    return {
+        authenticated: true,
+        status: 200,
+        error: "",
+        userId: link.userId,
+        linkId: link.id,
+    };
+}
+export function assertAuthorizedCaller(req, targetUserId) {
+    const tokenAuth = extractAndVerifyBearerToken(req);
+    if (!tokenAuth.authenticated) {
+        return {
+            authorized: false,
+            status: tokenAuth.status,
+            error: tokenAuth.error,
+        };
+    }
+    if (tokenAuth.userId !== targetUserId) {
+        return {
+            authorized: false,
+            status: 403,
+            error: "Forbidden: Authenticated token is not authorized for target user resource",
+        };
+    }
+    return {
+        authorized: true,
+        status: 200,
+        error: "",
+        authenticatedUserId: tokenAuth.userId,
+    };
+}
+apiRouter.patch("/users/:userId/consent", async (req, res) => {
+    const auth = assertAuthorizedCaller(req, req.params.userId);
+    if (!auth.authorized) {
+        return res.status(auth.status).json({ error: auth.error });
+    }
+    const parsed = updateConsentSchema.safeParse(req.body);
+    if (!parsed.success) {
+        return res.status(400).json({ error: parsed.error.flatten() });
+    }
+    const consent = await updateUserResearchConsent(req.params.userId, parsed.data.optedIn);
+    if (!consent) {
+        return res.status(404).json({ error: "User not found" });
+    }
+    res.json({ userId: req.params.userId, researchConsent: consent });
+});
+apiRouter.delete("/users/:userId/research-data", async (req, res) => {
+    const auth = assertAuthorizedCaller(req, req.params.userId);
+    if (!auth.authorized) {
+        return res.status(auth.status).json({ error: auth.error });
+    }
+    const user = db.data.users.find((u) => u.id === req.params.userId);
+    if (!user) {
+        return res.status(404).json({ error: "User not found" });
+    }
+    try {
+        const result = await deleteUserResearchData(req.params.userId);
+        res.json({ ok: true, deletedCount: result.deletedCount });
+    }
+    catch (err) {
+        const msg = err instanceof Error ? err.message : "Deletion failed";
+        res.status(500).json({ error: msg });
+    }
+});
+apiRouter.post("/research/samples", async (req, res) => {
+    const parsed = submitResearchSampleSchema.safeParse(req.body);
+    if (!parsed.success) {
+        return res.status(400).json({ error: parsed.error.flatten() });
+    }
+    const auth = assertAuthorizedCaller(req, parsed.data.userId);
+    if (!auth.authorized) {
+        return res.status(auth.status).json({ error: auth.error });
+    }
+    const result = await recordResearchSample(parsed.data);
+    if (!result.accepted) {
+        return res.status(400).json({ error: result.reason });
+    }
+    res.status(201).json(result);
+});
+apiRouter.get("/research/stats", (req, res) => {
+    const auth = extractAndVerifyBearerToken(req);
+    if (!auth.authenticated) {
+        return res.status(auth.status).json({ error: auth.error });
+    }
+    const stats = getResearchDatasetStats();
+    res.json(stats);
 });

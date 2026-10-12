@@ -17,5 +17,9 @@ const defaultData = {
     breakRecommendations: [],
     quizAttempts: [],
     rewardEvents: [],
+    researchSamples: [],
 };
 export const db = await JSONFilePreset(config.dbPath, defaultData);
+if (!db.data.researchSamples) {
+    db.data.researchSamples = [];
+}

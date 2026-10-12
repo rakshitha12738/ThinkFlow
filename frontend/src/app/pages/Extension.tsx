@@ -14,19 +14,37 @@ export default function ExtensionPage() {
   useEffect(() => {
     const interval = setInterval(async () => {
       try {
-        const res = await fetch(`${bridgeBaseUrl}/emotion`);
-        if (!res.ok) {
-          return;
+        let data: { typingMood?: string; faceMood?: string } | null = null;
+        try {
+          const res = await fetch(`${bridgeBaseUrl}/emotion`);
+          if (res.ok) {
+            data = (await res.json()) as { typingMood?: string; faceMood?: string };
+          }
+        } catch {
+          // Bridge on 8000 not reachable; fallback to main Express backend on 8080
         }
-        const data = (await res.json()) as { typingMood: string; faceMood: string };
-        setTypingMood(data.typingMood ?? "Neutral");
-        setFaceMood(data.faceMood ?? "Neutral");
 
-        const isFrustrated =
-          (data.typingMood ?? "").toLowerCase().includes("frustrated") ||
-          ["sad", "angry"].includes((data.faceMood ?? "").toLowerCase());
+        if (!data) {
+          try {
+            const fallbackRes = await fetch("http://localhost:8080/api/v1/emotion");
+            if (fallbackRes.ok) {
+              data = (await fallbackRes.json()) as { typingMood?: string; faceMood?: string };
+            }
+          } catch {
+            // Main backend also not reachable
+          }
+        }
 
-        setFinalMood(isFrustrated ? "Frustrated 😓" : "Confident 🔥");
+        if (data) {
+          setTypingMood(data.typingMood ?? "Neutral");
+          setFaceMood(data.faceMood ?? "Neutral");
+
+          const isFrustrated =
+            (data.typingMood ?? "").toLowerCase().includes("frustrated") ||
+            ["sad", "angry"].includes((data.faceMood ?? "").toLowerCase());
+
+          setFinalMood(isFrustrated ? "Frustrated 😓" : "Confident 🔥");
+        }
       } catch {
         // Keep polling non-blocking.
       }

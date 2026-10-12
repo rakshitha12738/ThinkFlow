@@ -281,6 +281,10 @@ test("XGBoost Emotion Classifier Suite", async (t) => {
       assert.ok(["frustration", "confidence", "neutral"].includes(extBody.snapshot.emotionSignal));
       assert.ok(extBody.vibeScore >= 0 && extBody.vibeScore <= 100);
       assert.ok(typeof extBody.adaptiveMode === "string");
+
+      // Verify AI mood entry was recorded
+      const userMoods = db.data.moodEntries.filter((m) => m.userId === "test-smoke-user" && m.source === "ai");
+      assert.ok(userMoods.length >= 1, "Expected AI mood entry to be recorded from extension event");
     } finally {
       await new Promise<void>((resolve, reject) => {
         server.close((err) => (err ? reject(err) : resolve()));
@@ -291,5 +295,84 @@ test("XGBoost Emotion Classifier Suite", async (t) => {
         // cleanup best-effort
       }
     }
+  });
+
+  await t.test("8. Candidate model artifact loads cleanly and performs rate-based inference", () => {
+    const candidatePath = path.resolve(process.cwd(), "models/xgboost-emotion-candidate.json");
+    if (!fs.existsSync(candidatePath)) {
+      return;
+    }
+
+    const candidateClassifier = new XGBoostEmotionClassifier(candidatePath);
+    assert.equal(candidateClassifier.isModelLoaded(), true);
+
+    const meta = candidateClassifier.getModelMetadata();
+    assert.ok(meta);
+    assert.equal(meta.classes?.length, 3);
+
+    const pred = candidateClassifier.predict({
+      charsTyped: 300,
+      wordsTyped: 60,
+      backspaces: 4,
+      errorCount: 1,
+      pauseMs: 4000,
+      durationMs: 60000,
+    });
+
+    assert.ok(pred);
+    assert.ok(["frustration", "confidence", "neutral"].includes(pred.emotionSignal));
+    assert.equal(pred.source, "xgboost");
+    assert.ok(pred.vibeScore >= 0 && pred.vibeScore <= 100);
+  });
+
+  await t.test("9. Robust handling of non-finite, negative, and extreme inputs", () => {
+    const classifier = new XGBoostEmotionClassifier();
+    classifier.loadModel(path.resolve(process.cwd(), "models/xgboost-emotion.json"));
+
+    const extremeInput = {
+      charsTyped: Number.NaN,
+      wordsTyped: Number.POSITIVE_INFINITY,
+      backspaces: -50,
+      errorCount: Number.NaN,
+      pauseMs: -1000,
+      durationMs: 0,
+    };
+
+    const result = classifier.predictWithFallback(extremeInput);
+    assert.ok(["frustration", "confidence", "neutral"].includes(result.emotionSignal));
+    assert.ok(Number.isFinite(result.vibeScore));
+    assert.ok(Number.isFinite(result.confidence));
+    assert.ok(result.vibeScore >= 0 && result.vibeScore <= 100);
+  });
+
+  await t.test("10. Reversible model promotion and rollback verification", () => {
+    const prodPath = path.resolve(process.cwd(), "models/xgboost-emotion.json");
+    const backupPath = path.resolve(process.cwd(), "models/xgboost-emotion.json.bak");
+
+    assert.ok(fs.existsSync(prodPath), "Production model must exist");
+    assert.ok(fs.existsSync(backupPath), "Backup model must exist for rollback safety");
+
+    const prodClassifier = new XGBoostEmotionClassifier(prodPath);
+    const backupClassifier = new XGBoostEmotionClassifier(backupPath);
+
+    assert.equal(prodClassifier.isModelLoaded(), true);
+    assert.equal(backupClassifier.isModelLoaded(), true);
+
+    const input = {
+      charsTyped: 250,
+      wordsTyped: 50,
+      backspaces: 10,
+      errorCount: 2,
+      pauseMs: 8000,
+      durationMs: 60000,
+    };
+
+    const prodPred = prodClassifier.predict(input);
+    const backupPred = backupClassifier.predict(input);
+
+    assert.ok(prodPred);
+    assert.ok(backupPred);
+    // Verifies backup is a valid rollback artifact with matching output
+    assert.equal(prodPred.emotionSignal, backupPred.emotionSignal);
   });
 });

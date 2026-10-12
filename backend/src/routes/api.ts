@@ -663,6 +663,35 @@ apiRouter.post("/extension/events/typing", async (req, res) => {
   };
 
   db.data.typingSnapshots.push(snapshot);
+
+  const aiMood = {
+    frustration: "frustrated",
+    confidence: "energetic",
+    neutral: "neutral",
+  } as const;
+
+  db.data.moodEntries.push({
+    id: nanoid(),
+    userId: parsed.data.userId,
+    timestamp: snapshot.timestamp,
+    mood: aiMood[analysis.emotionSignal],
+    energy: Math.max(1, Math.round(snapshot.vibeScore / 10)),
+    source: "ai",
+    confidence: Number((0.6 + snapshot.vibeScore / 250).toFixed(2)),
+  });
+
+  const today = toIsoDate(new Date(snapshot.timestamp));
+  const existingHabit = db.data.habitLogs.find((entry) => entry.userId === parsed.data.userId && entry.date === today);
+
+  if (!existingHabit) {
+    const inferred = inferHabitLogFromSnapshots(
+      parsed.data.userId,
+      db.data.typingSnapshots.filter((entry) => entry.userId === parsed.data.userId),
+      today,
+    );
+    db.data.habitLogs.push(inferred);
+  }
+
   await db.write();
 
   const recentSnapshots = db.data.typingSnapshots.filter((s) => s.userId === parsed.data.userId).slice(-6);
@@ -674,6 +703,8 @@ apiRouter.post("/extension/events/typing", async (req, res) => {
     adaptiveMode: adaptive.mode,
     reason: adaptive.reason,
     vibeScore: snapshot.vibeScore,
+    source: analysis.source,
+    modelVersion: analysis.modelVersion,
   });
 });
 
